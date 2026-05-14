@@ -7,7 +7,8 @@
 URL="registry-sc-harbor.amd.com/framework/therock-main"
 TAG="1347_gfx94X_7.13.0a20260506_ubuntu22.04_py3.11_pytorch_release-2.10_1a27007"
 TAG="1347_gfx94X_7.13.0a20260506_ubuntu24.04_py3.12_pytorch_release-2.11_443606e"
-IMAGE="${URL}:${TAG}"
+# Custom PyTorch 2.12 image built from ROCm/pytorch release/2.12
+IMAGE="therock-main:gfx94X_pytorch2.12_rocm7.13"
 
 NUM_GPUS=${1:-8}
 

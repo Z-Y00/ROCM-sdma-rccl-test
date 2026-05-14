@@ -1,0 +1,23 @@
+# Profiler outputs
+profile_output/
+*.pftrace
+*.pt.trace.json
+
+# Build artifacts
+build.log
+log
+log.ce_collectives_test
+log.mempool
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
