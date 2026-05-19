@@ -2,6 +2,14 @@
 profile_output/
 *.pftrace
 *.pt.trace.json
+*.json
+bench/traces/
+
+# Sibling project tracked in its own git repo
+rocm_sdma_comm_compute_overlap/
+
+# Built shared libs (interposer is built per-image in-container)
+*.so
 
 # Build artifacts
 build.log
