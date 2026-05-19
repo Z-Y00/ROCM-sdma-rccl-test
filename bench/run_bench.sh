@@ -15,6 +15,7 @@
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+DEBUG_DIR="${REPO_DIR}/debug"
 
 WHICH="${1:-both}"
 NPROC="${NPROC:-8}"
@@ -25,7 +26,7 @@ COMM_ITERS="${COMM_ITERS:-1}"
 
 IMAGE="${ROCM_BUG_TEST_IMAGE:-registry-sc-harbor.amd.com/framework/therock-main:1384_gfx94X_7.14.0a20260518_centosstream9_py3.12_pytorch_release-2.11_96bfee1}"
 
-INTERPOSER_B64=$(base64 -w0 "${REPO_DIR}/hip_attr_drain_preload.c")
+INTERPOSER_B64=$(base64 -w0 "${DEBUG_DIR}/hip_attr_drain_preload.c")
 COMMON_B64=$(base64 -w0 "${SCRIPT_DIR}/bench_common.py")
 AG_B64=$(base64     -w0 "${SCRIPT_DIR}/bench_ag_gemm.py")
 AR_B64=$(base64     -w0 "${SCRIPT_DIR}/bench_ar_gemm.py")

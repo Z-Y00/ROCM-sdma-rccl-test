@@ -1,13 +1,21 @@
 # sdma_rccl_pytorch
 
-Top-level workspace for two pieces of work on AMD MI300X:
+Top-level workspace for two pieces of work on AMD MI300X. Layout:
 
-1. **Interposer fix** for the "first kernel after `ncclMemAlloc` fails with
-   `hipErrorInvalidValue`" bug on RCCL's `NCCL_CUMEM_ENABLE=1` path
-   (lives in this directory).
-2. **SDMA-based comm/compute overlap benchmarks** for
-   AllGather+GEMM and AllReduce+GEMM (sub-project
-   `rocm_sdma_comm_compute_overlap/`).
+```
+debug/    interposer fix + bug-investigation reproducers
+bench/    AG+GEMM and AR+GEMM overlap benches
+docker/   image-build infrastructure (PyTorch 2.12 on top of TheRock 2.11 base)
+```
+
+1. **Interposer fix** (`debug/`) for the "first kernel after `ncclMemAlloc`
+   fails with `hipErrorInvalidValue`" bug on RCCL's `NCCL_CUMEM_ENABLE=1` path.
+2. **SDMA-based comm/compute overlap benchmarks** (`bench/`) for
+   AllGather+GEMM and AllReduce+GEMM. (Sibling sub-project
+   `rocm_sdma_comm_compute_overlap/` is its own git repo, not tracked here.)
+3. **PyTorch-2.12 build recipe** (`docker/`) for stacking PyTorch 2.12 on top
+   of the TheRock ROCm 7.14 / 2.11 base image; gives a notably better
+   torch.profiler trace where SDMA copy-engine kernels show up directly.
 
 ## Test images
 
@@ -21,10 +29,12 @@ registry-sc-harbor.amd.com/framework/therock-main:1384_gfx94X_7.14.0a20260518_ub
 
 ## (1) Interposer fix
 
-`hip_attr_drain_preload.c` is a tiny `LD_PRELOAD` shim that wraps
+All artifacts live under `debug/`.
+
+`debug/hip_attr_drain_preload.c` is a tiny `LD_PRELOAD` shim that wraps
 `hipDeviceGetAttribute` / `cuDeviceGetAttribute` and drains the per-thread
 `last_error` slot when the call fails. Built and validated end-to-end by
-`run_with_interposer.sh`:
+`debug/run_with_interposer.sh`:
 
 | stage | result |
 |---|---|
@@ -37,16 +47,16 @@ Files:
 
 | | |
 |---|---|
-| `hip_attr_drain_preload.c` | the `.so` source (gcc + libdl, no HIP deps) |
-| `hip_attr_probe.c` | minimal pure-HIP demonstrator of the TLS leak |
-| `pytorch_bug_repro.py` | minimal pure-PyTorch end-to-end reproducer |
-| `run_with_interposer.sh` | builds the `.so` in-container and runs both as A/B/C/D |
-| `run_hip_attr_probe.sh` | standalone "does this image have the leak?" check |
-| `run_bug_repros.sh` | standalone "does this image trigger the PyTorch bug?" check |
+| `debug/hip_attr_drain_preload.c` | the `.so` source (gcc + libdl, no HIP deps) |
+| `debug/hip_attr_probe.c` | minimal pure-HIP demonstrator of the TLS leak |
+| `debug/pytorch_bug_repro.py` | minimal pure-PyTorch end-to-end reproducer |
+| `debug/run_with_interposer.sh` | builds the `.so` in-container and runs both as A/B/C/D |
+| `debug/run_hip_attr_probe.sh` | standalone "does this image have the leak?" check |
+| `debug/run_bug_repros.sh` | standalone "does this image trigger the PyTorch bug?" check |
 
 User-facing one-liner workaround (no RCCL rebuild required):
 ```bash
-gcc -O2 -fPIC -shared hip_attr_drain_preload.c -o libhip_attr_drain.so -ldl
+gcc -O2 -fPIC -shared debug/hip_attr_drain_preload.c -o libhip_attr_drain.so -ldl
 LD_PRELOAD=$PWD/libhip_attr_drain.so NCCL_CUMEM_ENABLE=1 torchrun ... your_script.py
 ```
 
