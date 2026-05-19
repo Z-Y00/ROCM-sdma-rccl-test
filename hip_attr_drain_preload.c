@@ -51,8 +51,12 @@ typedef int (*get_last_err_fn)(void);
 static get_attr_fn      real_hipDeviceGetAttribute = NULL;
 static get_attr_fn      real_cuDeviceGetAttribute  = NULL;
 static get_last_err_fn  real_hipGetLastError       = NULL;
+static void            *amdhip_handle              = NULL;
 
 static int verbose = 0;
+
+/* fwd-decl: defined below the resolver, used by maybe_drain */
+static void *get_amdhip_handle(void);
 
 __attribute__((constructor))
 static void hip_attr_drain_init(void) {
@@ -79,16 +83,15 @@ static void hip_attr_drain_init(void) {
 
 static inline void maybe_drain(const char *who, int attr, int rc) {
     if (rc == 0) return;   /* hipSuccess / CUDA_SUCCESS == 0 */
-    /* Lazy-retry the dlsym: the HIP runtime may have been dlopen()ed
-     * by the host process AFTER our constructor ran (e.g. PyTorch loads
-     * libamdhip64.so lazily via libtorch_hip). */
     if (!real_hipGetLastError) {
-        real_hipGetLastError =
-            (get_last_err_fn) dlsym(RTLD_NEXT, "hipGetLastError");
-        if (!real_hipGetLastError) {
+        /* Same handle-based resolution: bypasses our own symbol space,
+         * avoids the RTLD_DEFAULT recursion hazard. */
+        void *h = get_amdhip_handle();
+        if (h) real_hipGetLastError =
+                (get_last_err_fn) dlsym(h, "hipGetLastError");
+        if (!real_hipGetLastError)
             real_hipGetLastError =
-                (get_last_err_fn) dlsym(RTLD_DEFAULT, "hipGetLastError");
-        }
+                (get_last_err_fn) dlsym(RTLD_NEXT, "hipGetLastError");
     }
     int drained = -1;
     if (real_hipGetLastError) drained = real_hipGetLastError();
@@ -100,18 +103,66 @@ static inline void maybe_drain(const char *who, int attr, int rc) {
     }
 }
 
+/* Lazy resolver. Symbol-interposing wrappers need to be careful:
+ *   - dlsym(RTLD_NEXT, ...) is caller-context-sensitive (it returns the
+ *     next definition after the caller in the link order). It works
+ *     reliably from THIS .so as long as libamdhip64.so was loaded
+ *     before us in the loader graph; it can return NULL otherwise.
+ *   - dlsym(RTLD_DEFAULT, ...) searches the global symbol table, which
+ *     contains OUR OWN wrapper symbol (LD_PRELOAD'd shared objects go
+ *     into the global scope). Using it as a fallback would resolve to
+ *     ourselves, giving infinite recursion -> stack overflow -> SEGV.
+ *     PyTorch 2.12's cuda-bindings cython modules hit exactly that path.
+ * So we explicitly dlopen("libamdhip64.so", ...NOLOAD) to get a handle
+ * to the real lib (already resident at this point) and dlsym against
+ * THAT handle -- guaranteed to bypass our own wrapper. */
+static void *get_amdhip_handle(void) {
+    if (amdhip_handle) return amdhip_handle;
+    /* RTLD_NOLOAD: don't trigger a fresh load, just hand back the
+     * existing in-memory handle if libamdhip64 has been loaded by
+     * anyone (PyTorch's libtorch_hip.so depends on it). */
+    amdhip_handle = dlopen("libamdhip64.so",   RTLD_LAZY | RTLD_NOLOAD);
+    if (!amdhip_handle)
+        amdhip_handle = dlopen("libamdhip64.so.7", RTLD_LAZY | RTLD_NOLOAD);
+    if (!amdhip_handle)
+        amdhip_handle = dlopen("libamdhip64.so.6", RTLD_LAZY | RTLD_NOLOAD);
+    /* Last-ditch: NOLOAD off, in case nobody has loaded it yet. */
+    if (!amdhip_handle)
+        amdhip_handle = dlopen("libamdhip64.so",   RTLD_LAZY);
+    return amdhip_handle;
+}
+
+static get_attr_fn resolve_attr(get_attr_fn *cache, const char *name) {
+    get_attr_fn fn = *cache;
+    if (fn) return fn;
+    /* Prefer dlsym(handle): bypasses our own wrapper symbol. */
+    void *h = get_amdhip_handle();
+    if (h) fn = (get_attr_fn) dlsym(h, name);
+    /* Fallback to RTLD_NEXT (caller-relative, but at least also bypasses
+     * us as long as our .so loaded before libamdhip64 in the chain). */
+    if (!fn) fn = (get_attr_fn) dlsym(RTLD_NEXT, name);
+    *cache = fn;
+    return fn;
+}
+
 /* ------------------------------------------------------------------ */
 /* hipDeviceGetAttribute -- caught directly by anyone in user code,
  *    including the hip_attr_probe.cpp reproducer.                    */
 /* ------------------------------------------------------------------ */
 int hipDeviceGetAttribute(int *value, int attrib, int device) {
-    if (!real_hipDeviceGetAttribute) {
-        /* Constructor may not have run if loader resolved the symbol
-         * before our ctor fired; resolve lazily. */
-        real_hipDeviceGetAttribute =
-            (get_attr_fn) dlsym(RTLD_NEXT, "hipDeviceGetAttribute");
+    get_attr_fn fn = resolve_attr(&real_hipDeviceGetAttribute,
+                                  "hipDeviceGetAttribute");
+    if (!fn) {
+        if (verbose) {
+            fprintf(stderr, "[hip_attr_drain] hipDeviceGetAttribute"
+                    " unresolved; faking hipErrorInvalidValue\n");
+        }
+        if (value) *value = 0;
+        return 1;   /* hipErrorInvalidValue -- safe, matches behavior for
+                     * unsupported attributes; caller code that ignores
+                     * the return (RCCL's allocator.cc) is unaffected. */
     }
-    int rc = real_hipDeviceGetAttribute(value, attrib, device);
+    int rc = fn(value, attrib, device);
     maybe_drain("hipDeviceGetAttribute", attrib, rc);
     return rc;
 }
@@ -122,11 +173,17 @@ int hipDeviceGetAttribute(int *value, int attrib, int device) {
  *    actually need to catch to fix the NCCL_CUMEM_ENABLE=1 bug.       */
 /* ------------------------------------------------------------------ */
 int cuDeviceGetAttribute(int *value, int attrib, int device) {
-    if (!real_cuDeviceGetAttribute) {
-        real_cuDeviceGetAttribute =
-            (get_attr_fn) dlsym(RTLD_NEXT, "cuDeviceGetAttribute");
+    get_attr_fn fn = resolve_attr(&real_cuDeviceGetAttribute,
+                                  "cuDeviceGetAttribute");
+    if (!fn) {
+        if (verbose) {
+            fprintf(stderr, "[hip_attr_drain] cuDeviceGetAttribute"
+                    " unresolved; faking hipErrorInvalidValue\n");
+        }
+        if (value) *value = 0;
+        return 1;
     }
-    int rc = real_cuDeviceGetAttribute(value, attrib, device);
+    int rc = fn(value, attrib, device);
     maybe_drain("cuDeviceGetAttribute", attrib, rc);
     return rc;
 }

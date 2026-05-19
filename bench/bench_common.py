@@ -15,12 +15,18 @@ LD_PRELOAD to libhip_attr_drain.so so we don't hit the FABRIC_SUPPORTED
 TLS-leak bug on the first cuMem-path allocation.
 """
 from __future__ import annotations
+import faulthandler
 import os
 import statistics
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Callable, Iterable, Sequence
+
+# Print a Python traceback on SIGSEGV / SIGABRT etc. Without this, torchrun
+# reports only "exitcode -11" with no signal context. Cheap; no runtime cost
+# unless we actually crash.
+faulthandler.enable()
 
 import torch
 import torch.distributed as dist
