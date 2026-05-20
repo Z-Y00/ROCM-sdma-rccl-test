@@ -1,0 +1,76 @@
+# Llama-3 70B on a single node of 8x MI300X (192 GB HBM each), ROCm 7.14.
+# Targets torchtitan v0.2.0 + the PyTorch-2.12 image built by
+# ../docker/build_pytorch212.sh.
+#
+# Memory budget rough:
+#   weights bf16   : 70B * 2  = 140 GB total, /8 = 17.5 GB per rank
+#   grads bf16     : 17.5 GB per rank
+#   optimizer st.  : ~17 GB per rank with FSDP shard + AdamW fp32
+#   activations    : sized by seq_len * batch * hidden; full ACK controls it
+# FSDP=8 (full shard) + full activation checkpointing comfortably fits.
+
+[job]
+dump_folder = "/workspace/outputs"
+description = "Llama 3 70B single-node 8x MI300X bring-up"
+
+[profiling]
+enable_profiling   = false
+save_traces_folder = "profile_trace"
+profile_freq       = 100
+
+[metrics]
+log_freq           = 1
+enable_tensorboard = false
+save_tb_folder     = "tb"
+
+[model]
+name           = "llama3"
+flavor         = "70B"
+# Where the runner stages the downloaded tokenizer + HF metadata. Override
+# via --model.hf_assets_path on the command line if you move things.
+hf_assets_path = "/workspace/torchtitan/assets/hf/llama3"
+
+[optimizer]
+name = "AdamW"
+lr   = 1.5e-4
+eps  = 1e-8
+
+[lr_scheduler]
+warmup_steps = 200
+
+[training]
+local_batch_size = 1
+seq_len          = 8192
+max_norm         = 1.0
+steps            = 100         # bring-up: keep short
+dataset          = "c4"        # streamed HF c4; runner sets HF cache dir
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree     = 8     # FSDP across all 8 GPUs
+tensor_parallel_degree         = 1
+pipeline_parallel_degree       = 1
+context_parallel_degree        = 1
+
+[checkpoint]
+enable               = false
+folder               = "checkpoint"
+interval             = 500
+last_save_model_only = true
+export_dtype         = "float32"
+async_mode           = "disabled"
+
+[activation_checkpoint]
+mode = "full"
+
+[compile]
+enable     = false
+components = ["model", "loss"]
+
+[quantize.linear.float8]
+enable_fsdp_float8_all_gather             = false
+precompute_float8_dynamic_scale_for_fsdp  = false
+filter_fqns                               = ["output"]
+
+[validation]
+enable = false

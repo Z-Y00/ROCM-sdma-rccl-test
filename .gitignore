@@ -4,6 +4,12 @@ profile_output/
 *.pt.trace.json
 *.json
 bench/traces/
+torchtitan/outputs*/
+debug/outputs*/
+# rocprof / torch.profiler harness output dirs
+debug/*_out/
+debug/bench_traces/
+debug/sdma_sweep_out/
 
 # Sibling project tracked in its own git repo
 rocm_sdma_comm_compute_overlap/

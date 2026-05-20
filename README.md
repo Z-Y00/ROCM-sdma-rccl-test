@@ -3,9 +3,10 @@
 Top-level workspace for two pieces of work on AMD MI300X. Layout:
 
 ```
-debug/    interposer fix + bug-investigation reproducers
-bench/    AG+GEMM and AR+GEMM overlap benches
-docker/   image-build infrastructure (PyTorch 2.12 on top of TheRock 2.11 base)
+debug/        interposer fix + bug-investigation reproducers
+bench/        AG+GEMM and AR+GEMM overlap benches
+docker/       image-build infrastructure (PyTorch 2.12 on top of TheRock 2.11 base)
+torchtitan/   Llama-3 70B torchtitan training on 8x MI300X
 ```
 
 1. **Interposer fix** (`debug/`) for the "first kernel after `ncclMemAlloc`
@@ -16,6 +17,9 @@ docker/   image-build infrastructure (PyTorch 2.12 on top of TheRock 2.11 base)
 3. **PyTorch-2.12 build recipe** (`docker/`) for stacking PyTorch 2.12 on top
    of the TheRock ROCm 7.14 / 2.11 base image; gives a notably better
    torch.profiler trace where SDMA copy-engine kernels show up directly.
+4. **Llama-3 70B torchtitan training** (`torchtitan/`) on top of (3), with
+   the LD_PRELOAD interposer and CE-collective env wired in. Script-only
+   for now (node busy); see `torchtitan/README.md` for prereqs and knobs.
 
 ## Test images
 
@@ -178,6 +182,271 @@ elsewhere in the same file), the leak would never propagate. The
 upstream RCCL patch fixes the amplifier; the HIP runtime change would
 fix the source. The interposer fixes the amplifier at the symbol level
 so any other caller that makes the same mistake is also covered.
+
+## (1b) CE/SDMA env knobs + `hipMemRetainAllocationHandle` SIGSEGV
+
+The CE/SDMA collective path is controlled by four knobs that the bench and
+the torchtitan runner both set. Each does a distinct thing. Mis-combining
+them tips RCCL into a HIP-runtime bug that crashes
+`dist.all_gather_into_tensor` (and every FSDP step, since FSDP's first op
+is an AllGather).
+
+### Knob reference
+
+| env var | what it controls | default | required for | source-truth |
+|---|---|---|---|---|
+| `NCCL_CTA_POLICY=2` | Launch collectives with **zero CTAs** (NCCL_CTA_POLICY_ZERO). With zero CTAs the data movement falls off the SMs and lands on the **copy engines (CE/SDMA)**. | unset (=full CTA) | CE/SDMA AG/RS; bench overlap | RCCL `init.cc` / `ProcessGroupNCCL::Options.config.cta_policy`. **Note:** PyTorch passes `pg_options.config.cta_policy = NCCL_CTA_POLICY_ZERO` directly to `init_process_group` in our probes and in Torchtitan, so the env var is overridden at PG-construction time. |
+| `NCCL_CUMEM_ENABLE=1` | RCCL's **internal staging buffers** are allocated via the cuMem API (`hipMemCreate` + `hipMemMap`) instead of `hipMalloc`. Required so the staging buffers can be IPC-exported as cuMem handles, which is what the P2P/CUMEM transport needs to do CE-direct GPU↔GPU transfers. | unset (=0) | the P2P/CUMEM transport that CE/SDMA rides on; also `ncclMemAlloc` / `symm_mem.empty` | RCCL `allocator.cc`; bench `bench/run_bench.sh` `ce_env()` |
+| `NCCL_LOCAL_REGISTER=2` | RCCL **auto-registers user send/recv buffers for direct IPC** at each collective enqueue. Effect: the CE collective DMAs the user buffer **directly** into the remote peer's user buffer, skipping one CE memcpy on each side that otherwise stages through RCCL's internal cuMem buffer. **Pure perf optimization; not required for CE/SDMA to work.** | `1` (enabled) | none — opt-in fast path | RCCL `coll_reg.cc` (top-level `ncclParamLocalRegister` gate); RCCL `transport/p2p.cc` `ipcRegisterBuffer` (the function that crashes — see bug below) |
+| `TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK=true` | PyTorch caching allocator calls `ncclCommRegister` on every new slab, populating RCCL's `ncclReg` table so the LOCAL_REGISTER fast-path can find user buffers. Without it, RCCL's `ncclRegFind` returns NULL for FSDP's `torch.empty`-backed buffers and the registration path is a no-op. | unset (=false) | the LOCAL_REGISTER fast-path | PyTorch `c10d/ProcessGroupNCCL.cpp` |
+
+### What goes wrong: `hipMemRetainAllocationHandle` SIGSEGV
+
+**`libamdhip64.so.7` (ROCm 7.14, build `39213316d2`) segfaults inside
+`hipMemRetainAllocationHandle` when called on a VA that wasn't created via
+`hipMemCreate`/`cuMemCreate`** (i.e. anything from `hipMalloc` or PyTorch's
+caching allocator). The function is supposed to return `hipErrorInvalidValue`
+on such VAs; RCCL explicitly handles that return code by falling back to
+legacy `cudaIpcGetMemHandle` (`rocm-systems/projects/rccl/src/transport/p2p.cc:890`):
+
+```c
+// Get the mem handle for that buffer. It may have been allocated through
+// cudaMalloc in which case we'll get the CUDA legacy mem handle, or through cuMem*.
+if (ncclCuMemEnable()) {
+  CUmemGenericAllocationHandle handle;
+  if (CUPFN(cuMemRetainAllocationHandle(&handle, baseAddr)) != CUDA_SUCCESS) {
+    // if cuMem* export fails, retry legacy export
+    if (comm->directMode || !ncclParamLegacyCudaRegister()) goto fail;
+    CUDACHECKGOTO(cudaIpcGetMemHandle(&ipcInfo.ipcDesc.devIpc, baseAddr), ret, fail);
+    ...
+```
+
+The fallback never runs because the call crashes instead of returning. The
+faulting instruction in `libamdhip64.so.7+0x466ce3` is a second-level NULL
+deref inside the runtime's per-allocation tracker:
+
+```
+call <ROCm allocation-tracker lookup>    ; rax = tracker entry (non-null for hipMalloc'd VAs)
+test %rax,%rax / je <ret_invalid>        ; passes
+mov  0x100(%rax),%rax                    ; rax = tracker->cuMemSlot (non-null on this build)
+mov  0xf8(%rax),%r15                     ; r15 = cuMemSlot->handle  <-- NULL deref, SIGSEGV
+```
+
+Independent pure-HIP reproducer (no RCCL, no PyTorch, no distributed): see
+`debug/hip_retain_handle_probe.c`. Output:
+
+```
+mode=null      hipMemRetainAllocationHandle(NULL)        -> 1 (invalid argument)   ✓
+mode=cumem     hipMemCreate + hipMemMap + retain         -> 0 (success), handle=...  ✓
+mode=hipmalloc hipMalloc + hipMemset + retain            -> SIGSEGV (core dumped)   ✗
+```
+
+### Minimal trigger combo and ablation matrix
+
+In RCCL terms the crash needs all three of:
+
+1. `NCCL_LOCAL_REGISTER != 0` — opens the gate at the top of `ncclRegisterCollBuffers`.
+2. `TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK=true` — so `ncclRegFind` actually finds the user buffer.
+3. `NCCL_CUMEM_ENABLE=1` — so `ipcRegisterBuffer` takes the cuMem branch.
+
+…plus a user buffer that's `hipMalloc`'d, not cuMem-backed. The bench
+(`bench_ag_gemm.py`) doesn't crash because its buffers come from
+`symm_mem.empty → ncclMemAlloc → cuMemCreate`. FSDP / Torchtitan / our
+`regular_ag` probe crash because their buffers come from the PyTorch
+caching allocator (plain `hipMalloc`).
+
+Verified by ablation (`debug/run_ce_ablation.sh`, `regular_ag` mode,
+8 ranks on MI300X, kernel 6.5.0-45):
+
+| preset | CTA_POLICY | CUMEM_ENABLE | LOCAL_REGISTER | ALLOCATOR_HOOK | result |
+|---|---|---|---|---|---|
+| `baseline_default` | – | – | 0 | false | PASS |
+| `no_reg_at_all` | 2 | 1 | 0 | false | PASS |
+| `no_local_register` | 2 | 1 | **0** | true | PASS |
+| `no_allocator_hook` | 2 | 1 | 2 | **false** | PASS |
+| `no_cumem` | 2 | **0** | 2 | true | PASS |
+| `only_local_register` | – | – | 2 | false | PASS |
+| `only_allocator_hook` | – | – | 0 | true | PASS |
+| `cumem_plus_hook` | – | 1 | 0 | true | PASS |
+| `ce_full` | 2 | 1 | 2 | true | **CRASH** |
+| `no_cta_policy` | – | 1 | 2 | true | **CRASH** |
+
+`NCCL_CTA_POLICY` is irrelevant to the crash (PyTorch passes
+`cta_policy=NCCL_CTA_POLICY_ZERO` via PG opts in any case).
+
+### Workaround
+
+Set **`NCCL_LOCAL_REGISTER=0`** in the FSDP / Torchtitan environment, keeping
+everything else CE-mode. Verified that this avoids the
+`ipcRegisterBuffer → hipMemRetainAllocationHandle` call path entirely
+(the top-of-function gate in `ncclRegisterCollBuffers` closes).
+
+FSDP trains end-to-end (see `torchtitan/outputs_ce_localreg0/`,
+Llama-3 70B, 5 steps, MFU ~23.6 % at step 5).
+
+Other single-knob disablements that also avoid the crash (with different
+trade-offs): turning off `TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK`,
+or turning off `NCCL_CUMEM_ENABLE` (this breaks `ncclMemAlloc` /
+`symm_mem` and the bench, so not viable for the bench but is fine for
+plain FSDP).
+
+### Verified via rocprof: this workaround does NOT put FSDP on the real SDMA path
+
+Per-rank `rocprofv3 --hsa-amd-trace` comparison (see
+`debug/run_bench_rocprof.sh` and `debug/run_sdma_rocprof.sh`):
+
+| API | bench (`symm_mem` AG) | FSDP CE + LOCAL_REGISTER=0 | FSDP TRUE RING (`NCCL_CUMEM_ENABLE=0`) |
+|---|---|---|---|
+| **`hsa_amd_memory_async_batch_copy`** | **22** (21.6 ms) | **0** | **0** |
+| `hsa_amd_memory_async_copy_on_engine` | 1 (init only) | 1 (init only) | 1 (init only) |
+| `hsa_amd_signal_create` | 33,185 | 31,000 | 420 |
+| `hsa_amd_vmem_map` / `_unmap` | 622 / 622 | 532 / 532 | 0 / 0 |
+| `hsa_amd_vmem_export/import_shareable_handle` | 238 / 238 | 168 / 168 | 0 / 0 |
+| `hsa_amd_ipc_memory_create/attach/detach` | 0 / 0 / 0 | 0 / 0 / 0 | 168 / 168 / 168 |
+| GPU kernel doing the bytes | **`__amd_rocclr_batchMemOp.kd`** | `ncclDevKernel_Generic_2` | `ncclDevKernel_Generic_2` |
+
+`hsa_amd_memory_async_batch_copy` is rocclr's canonical SDMA dispatch
+API (its GPU-side stub kernel is `__amd_rocclr_batchMemOp.kd`). The
+**bench** uses it 22 times across its 8 AG iterations. **FSDP uses it
+zero times** in either CE or TRUE RING configuration — the bytes move
+inside `ncclDevKernel_Generic_2`, which is RCCL's own generic kernel
+running on CUs and reading/writing peer-mapped VAs directly. The cuMem
+`vmem_*` plumbing FSDP sets up is used for **peer address translation**,
+not for **SDMA dispatch**. NCCL's `Channel XX/0 ... via P2P/CUMEMCUMEM`
+init line therefore only attests to the cuMem transport setup, **not** to
+SDMA usage for the actual data movement.
+
+This contradicts what an earlier write-up in this README claimed
+(it implied "CE/SDMA stays active under LOCAL_REGISTER=0"). The
+workaround keeps FSDP working and on the cuMem IPC transport, but the
+copy-engine dispatch path used by the bench is **not yet reachable from
+FSDP** with `cudaMalloc`-backed AG buffers. The path forward is to
+allocate FSDP's AG send/recv buffers via `symm_mem.empty` (cuMem-backed),
+which is what the `staged_symm_ag` mode in
+`debug/fsdp_like_ag_probe.py` prototypes.
+
+Three follow-up artifacts contain the raw evidence:
+
+| | |
+|---|---|
+| `debug/run_bench_rocprof.sh` | runs `bench_ar_gemm.py --mode sdma` under `rocprofv3 --hsa-amd-trace`; outputs `debug/bench_rocprof_out/rank{0..7}/trace_hsa_api_stats.csv` |
+| `debug/run_sdma_rocprof.sh` | runs `fsdp_like_ag_probe.py --mode regular_ag` under the same rocprof harness, in both `ce_localreg0` and `true_ring` configurations |
+| `debug/run_sdma_sweep.sh` | sweep harness used to pin the discriminator: `MODE x NCCL_LOCAL_REGISTER` matrix under rocprof, see next subsection |
+| `debug/run_bench_profile.sh` | runs the bench under `torch.profiler` for chrome-trace inspection; the diff to `torchtitan/outputs_ce_localreg0/profile_trace/iteration_5/rank0_trace.json` shows `__amd_rocclr_batchMemOp.kd` only in the bench |
+
+### Path to real SDMA in FSDP: `SymmMemAllGather`
+
+The root question is now: **what makes RCCL choose the SDMA dispatch path
+vs the on-CU generic kernel?** Sweep matrix (`debug/run_sdma_sweep.sh`,
+8 ranks × 3 iters, NUMEL = 32 MB bf16/rank), counting
+`hsa_amd_memory_async_batch_copy` across all 8 ranks:
+
+| cell (mode × NCCL_LOCAL_REGISTER) | AG output buffer | `batch_copy` calls | SDMA? |
+|---|---|---|---|
+| `symm_ag` × 0 | `symm_mem.empty` | **24** (3/rank) | **YES** |
+| `symm_ag` × 2 | `symm_mem.empty` | **24** | **YES** |
+| `staged_symm_ag` × 0 | regular → `symm_mem` staging → AG | **24** | **YES** |
+| `regular_ag` × 0 | `torch.full` (`hipMalloc`) | 0 | NO |
+| `fsdp_forward` × 0 | FSDP default (`torch.empty` via DefaultAllGather) | 0 | NO |
+| `fsdp_forward_symm` × 0 | FSDP via `SymmMemAllGather` (`symm_mem.empty`) | **192** (~24/rank) | **YES** |
+
+**Two clean conclusions:**
+
+1. **The discriminator is buffer provenance, not the env knob.** `symm_ag`
+   fires `batch_copy` 24 times whether `NCCL_LOCAL_REGISTER=0` or `=2`.
+   The rocclr SDMA dispatch path triggers purely on "is the user buffer
+   cuMem-backed?". `NCCL_LOCAL_REGISTER` is orthogonal (it controls the
+   IPC auto-registration that hits the unrelated `hipMemRetainAllocationHandle`
+   crash; see above).
+2. **The fix is one PyTorch call: `module.set_custom_all_gather(SymmMemAllGather(group))`**
+   (and the analogous `set_custom_reduce_scatter`). PyTorch 2.12 already
+   ships `SymmMemAllGather` in `torch.distributed.fsdp._fully_shard._fsdp_collectives`
+   — its `allocate()` uses `symm_mem.get_mem_pool(device)` so the AG
+   output buffer is cuMem-backed. The source comment literally explains
+   what we observed:
+   ```
+   # Calling regular all-gather would already cause libraries like NCCL to
+   # use its optimized all-gather implementation for symmetric memory:
+   #   - Copy Engine All-Gather (when zero-CTA policy is enabled)
+   #   - Symmetric Kernel All-Gather (when zero-CTA policy is not enabled)
+   ```
+
+The exact alloc site that needed to change is
+`pytorch/torch/distributed/fsdp/_fully_shard/_fsdp_collectives.py:351`:
+```python
+all_gather_output = all_gather_comm.allocate(   # default: DefaultAllGather -> torch.empty (hipMalloc)
+    (all_gather_input_numel * world_size,), dtype=dtype, device=device,
+)
+```
+After `fully_shard()`, wiring in the SDMA-eligible alloc looks like:
+```python
+from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
+    SymmMemAllGather, SymmMemReduceScatter,
+)
+group = dist.group.WORLD
+for m in (model, *model):                       # outer + each per-layer FSDP unit
+    m.set_custom_all_gather(SymmMemAllGather(group))
+    m.set_custom_reduce_scatter(SymmMemReduceScatter(group))
+```
+
+See `debug/fsdp_like_ag_probe.py --mode fsdp_forward_symm` for the
+working reference. Under rocprof it produces `192 hsa_amd_memory_async_batch_copy`
+calls (3 iters × 8 layers × 8 ranks) vs `0` for the unmodified
+`fsdp_forward` mode.
+
+Known caveats with the `SymmMemAllGather` switch:
+- **Teardown noise.** With `SymmMemAllGather` enabled, every rank emits
+  `c10::DistBackendError: NCCL communicator was aborted on rank N`
+  during `destroy_process_group`. Forward / backward / step all run
+  correctly; the abort happens after the last step. Likely the symm_mem
+  mempool is not drained before PG destroy. Functional-only; needs a
+  fix.
+- **`hsa_amd_memory_async_copy_on_engine` stays at 552/rank in both
+  modes** — those are FSDP's `all_gather_copy_in/out` boundary memcpys
+  (param shard packing/unpacking). They were already on the SDMA engine
+  via the runtime's per-op dispatch; they are independent of the AG
+  output buffer change.
+
+### Fix proposals (in order of where the fix belongs)
+
+1. **PyTorch FSDP wiring (the actual fix to use SDMA in FSDP):** call
+   `module.set_custom_all_gather(SymmMemAllGather(group))` and
+   `module.set_custom_reduce_scatter(SymmMemReduceScatter(group))` on
+   every fully_shard'd module after construction. Already in PyTorch
+   2.12; just needs to be opted into by Torchtitan. Independent of the
+   `hipMemRetainAllocationHandle` crash, and works with
+   `NCCL_LOCAL_REGISTER=0`.
+2. **HIP runtime (still worth fixing):** add a NULL check on the
+   per-allocation cuMem-handle sub-slot in
+   `hipMemRetainAllocationHandle`; return `hipErrorInvalidValue` instead
+   of dereferencing NULL when the VA wasn't created via `cuMemCreate`.
+   Matches CUDA driver behavior and unblocks RCCL's existing legacy-IPC
+   fallback, which would let `NCCL_LOCAL_REGISTER=2` be safe again.
+3. **RCCL workaround:** probe with `hipPointerGetAttribute` before
+   calling `cuMemRetainAllocationHandle`; skip the cuMem branch when the
+   buffer isn't cuMem-backed.
+4. **User-side LD_PRELOAD shim:** same shape as
+   `debug/hip_attr_drain_preload.c`; wrap `hipMemRetainAllocationHandle`
+   so non-cuMem VAs return `hipErrorInvalidValue` without entering the
+   runtime. No RCCL/PyTorch rebuilds required.
+5. **User env workaround (avoids crash, does not enable SDMA):**
+   `NCCL_LOCAL_REGISTER=0`. Use as a default unless/until (1) lands;
+   does not by itself put the AG on the SDMA path.
+
+### Files
+
+| | |
+|---|---|
+| `debug/fsdp_like_ag_probe.py` | Five-mode AG reproducer: `symm_ag` (cuMem buffers, works + SDMA), `regular_ag` (caching-allocator buffers, crashes under LOCAL_REG=2, no SDMA), `staged_symm_ag` (regular→symm staging, gets SDMA), `fsdp_forward` (tiny FSDP2 model, matches Torchtitan stack, no SDMA), **`fsdp_forward_symm` (FSDP2 + `set_custom_all_gather(SymmMemAllGather(...))`, gets SDMA)** |
+| `debug/run_fsdp_like_probe.sh` | One-shot container runner for the probe; forwards `NCCL_DEBUG[_SUBSYS]` |
+| `debug/run_ce_ablation.sh` | Drives the probe with named env presets to ablate each CE knob independently. Explicit `NCCL_LOCAL_REGISTER=0` / `…ALLOCATOR_HOOK=false` in off-presets because RCCL defaults `LOCAL_REGISTER=1` and unsetting is not enough |
+| `debug/run_sdma_sweep.sh` | sweep harness used to pin the SDMA discriminator: runs each probe mode (and each NCCL_LOCAL_REGISTER value) under `rocprofv3 --hsa-amd-trace`, then counts `hsa_amd_memory_async_batch_copy` per cell |
+| `debug/run_sdma_rocprof.sh` | rocprof harness for the original ce_localreg0-vs-true_ring comparison (regular_ag mode) |
+| `debug/run_bench_rocprof.sh` | rocprof harness for `bench_ar_gemm.py --mode sdma` (the known-good SDMA path) |
+| `debug/run_bench_profile.sh` | torch.profiler chrome-trace harness for the bench; the diff to a torchtitan trace shows `__amd_rocclr_batchMemOp.kd` only in the bench |
+| `debug/hip_retain_handle_probe.c` | Pure-HIP, no-RCCL, no-PyTorch reproducer. Three modes: `null` (clean error), `cumem` (success), `hipmalloc` (SIGSEGV) |
+| `debug/run_hip_retain_handle_probe.sh` | Builds + runs the pure-HIP probe in three sibling containers (each mode in its own process so SIGSEGV in one doesn't poison the next) |
+| `debug/ROOT_CAUSE_hipMemRetainAllocationHandle.md` | Full write-up: symptom, crash decode, RCCL call chain w/ source quote, ablation matrix, pure-HIP repro transcript, fix proposals |
 
 ## (2) Comm/compute overlap benchmarks
 
