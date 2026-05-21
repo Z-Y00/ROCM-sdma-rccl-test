@@ -347,21 +347,121 @@ Two additions there:
 | `examples/torchtitan/configs/MI300X/llama3.1_{8B,70B}-BF16-SDMA-pretrain.yaml` | Experiment YAMLs that flip the patch on, point `model.hf_assets_path` at a runner-provided dir (`PRIMUS_HF_ASSETS_PATH`) for the public `unsloth/Meta-Llama-3.1-70B-Instruct` tokenizer mirror, and drop the `primus_turbo` model converter for a minimal SDMA bring-up. |
 | `torchtitan/run_primus_sdma.sh` (this repo) | Runner that launches the lorrisync image, mounts the Primus submodule, pip-installs the minimal Primus deps, stages the public unsloth tokenizer to a host dir, exports the CE env (`NCCL_CTA_POLICY=2 NCCL_CUMEM_ENABLE=1 NCCL_LOCAL_REGISTER=0 TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK=true LD_PRELOAD=libhip_attr_drain.so NCCL_SOCKET_IFNAME=lo`), and runs `primus-cli direct -- train pretrain --config <8B\|70B>-SDMA-pretrain.yaml`. Knobs: `SCALE=8b\|70b`, `STEPS=N`, `TOKENIZER_REPO=...`. |
 
-Smoke results on 8x MI300X, this build (5-step mock_data smoke):
+**Steady-state perf on 8x MI300X, Llama-3 70B BF16, FSDP=8, `local_batch_size=2`
+`seq_len=8192` `mock_data=true` `full-ACK`, step 5 readings (`SDMA_MODE=on|off`
+A/B in the same Primus / lorrisync image stack):**
 
-| scale | step 1 (warmup) | steady state (step 5) | memory |
-|---|---|---|---|
-| Llama-3.1 8B  | tps 120 / mfu 0.4 % | **tps 2960 / mfu 10.99 %** | 27.27 GiB |
-| Llama-3.1 70B | tps 138 / mfu 4.79 % | **tps 595  / mfu 20.55 %** | 164.89 GiB |
+| variant | tps | TFLOPs/GPU | TFLOPs total (8 GPU) | MFU | memory |
+|---|---|---|---|---|---|
+| **SDMA OFF** (DefaultAllGather)        | 732 | 352.5 | 2,820 | 27.11 % | 177.27 GiB (92.3 %) |
+| **SDMA ON** (SymmMemAllGather, this patch) | **739** | **355.6** | **2,845** | **27.35 %** | 185.37 GiB (96.5 %) |
+| Δ                                       | **+7 (+1.0 %)** | **+3.1** | **+25** | **+0.24 pp** | +8 GiB (+4 pp) |
 
-(For comparison, the same 70B workload on the *default* `DefaultAllGather`
-path through this repo's `torchtitan/run_train.sh` lands at step 5
-tps 682 / mfu 23.6 %. The SDMA path is slightly slower at this
-small-batch, full-ACK config because comm is already well-hidden by
-recompute, and the SymmMem mempool adds a first-step warmup cost. The
-SDMA path wins on comm-bound workloads where the rocclr SDMA dispatch
-keeps the CUs entirely free; the SDMA-vs-CU choice was independently
-verified via rocprof in the section above.)
+Same wall behavior at this scale. The SDMA patch's value at this workload
+is **architectural rather than a wallclock win** -- chrome traces show the
+GPU compute stream sits at **99.7 %** utilization in both modes (compute
+is dominant under full-ACK), so the GPU-side −46 % collective-kernel
+reduction we measured in v1 has no idle window to recover. The patch
+remains "live" so that comm-heavier configurations (selective/no ACK,
+lower per-rank batch, larger world, MoE) can pick up the SDMA path
+without further code changes -- just flip
+`primus_sdma.enable_symm_mem_collectives` in the YAML.
+
+### Reproducing the SDMA verification and the A/B perf comparison
+
+All commands assume `/apps/tas/lorrirao/sdma_rccl_pytorch` is the repo
+root and the `lorrisync/therock-main:gfx94X_pytorch2.12_rocm7.14_96bfee1`
+image is local. The Primus submodule is auto-checked out at the right
+commit by `git submodule update --init`.
+
+```bash
+# 0. Fresh checkout (one-time)
+git clone --recurse-submodules git@github.com:Z-Y00/ROCM-sdma-rccl-test.git
+cd ROCM-sdma-rccl-test
+docker pull lorrisync/therock-main:gfx94X_pytorch2.12_rocm7.14_96bfee1
+```
+
+#### A. Show SDMA actually fires (1 minute, rocprof on a tiny FSDP probe)
+
+```bash
+cd debug
+NUMEL=16777216 MODE=fsdp_forward_symm ITERS=3 \
+  OUT_HOST=$PWD/rocprof_out \
+  ./run_sdma_sweep.sh
+# Look at counts of hsa_amd_memory_async_batch_copy per rank:
+python3 -c "
+import csv, glob
+for p in sorted(glob.glob('rocprof_out/fsdp_forward_symm_lr0/rank*/trace_hsa_api_stats.csv')):
+    n = next((int(r['Calls']) for r in csv.DictReader(open(p))
+              if r['Name']=='hsa_amd_memory_async_batch_copy'), 0)
+    print(f'  {p.split(\"/\")[-2]}: hsa_amd_memory_async_batch_copy = {n}')
+"
+# Expect 24 per rank (3 iters x 8 layers); 0 with --mode fsdp_forward.
+```
+
+`debug/run_sdma_sweep.sh` already drives 5 cells
+(`symm_ag x {0,2}`, `staged_symm_ag x 0`, `regular_ag x 0`,
+`fsdp_forward x 0`, `fsdp_forward_symm x 0`) — drop the `SWEEP=...`
+or `MODE=...` override to run the full matrix.
+
+#### B. A/B perf compare via Primus on real torchtitan (~4 minutes per pass)
+
+```bash
+# 1. SDMA OFF (default DefaultAllGather, same env+image+stack)
+SCALE=70b SDMA_MODE=off \
+  OUTPUTS_HOST=$PWD/torchtitan/outputs_primus_70b_bs2_sdmaoff \
+  ./torchtitan/run_primus_sdma.sh
+
+# 2. SDMA ON (our patch: SymmMemAllGather + SymmMemReduceScatter)
+SCALE=70b SDMA_MODE=on \
+  OUTPUTS_HOST=$PWD/torchtitan/outputs_primus_70b_bs2_sdmaon \
+  ./torchtitan/run_primus_sdma.sh
+
+# 3. Compare step lines
+for tag in sdmaoff sdmaon; do
+  echo "--- $tag ---"
+  grep -E "step: " torchtitan/outputs_primus_70b_bs2_${tag}/torchtitan_outputs/train.log \
+    | sed 's/\x1b\[[0-9;]*m//g' | head -6
+done
+```
+
+The runner (`torchtitan/run_primus_sdma.sh`) handles everything
+end-to-end: builds `libhip_attr_drain.so`, downloads the public
+`unsloth/Meta-Llama-3.1-70B-Instruct` tokenizer (no `HF_TOKEN` needed),
+mounts the Primus submodule, pip-installs the minimal Primus deps,
+exports the CE env we verified safe on this build (`NCCL_CTA_POLICY=2
+NCCL_CUMEM_ENABLE=1 NCCL_LOCAL_REGISTER=0
+TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK=true
+NCCL_SOCKET_IFNAME=lo LD_PRELOAD=libhip_attr_drain.so`), and runs
+`primus-cli direct -- train pretrain --config <yaml>`. The
+`SDMA_MODE=on/off` switch selects between the two sibling YAMLs in the
+Primus submodule:
+`examples/torchtitan/configs/MI300X/llama3.1_70B-BF16-{SDMA,CE-baseline}-pretrain.yaml`.
+Each pass writes a chrome trace at iteration 5 under
+`outputs_primus_70b_bs2_${tag}/torchtitan_outputs/profile_traces/iteration_5/rank0_trace.json`
+that you can drop into <https://ui.perfetto.dev> to diff the per-AG
+breakdown.
+
+#### C. Same A/B without Primus (direct torchtitan via the existing runner)
+
+```bash
+# Independent baseline runner that does NOT go through Primus; useful
+# to confirm the SDMA-vs-default delta is the same outside the Primus
+# stack, and to compare against the pre-Primus numbers in section (1).
+CE_MODE=1 STEPS=5 SEQ_LEN=8192 BATCH_SIZE=2 PROFILE=1 PROFILE_FREQ=5 \
+  OUTPUTS_HOST=$PWD/torchtitan/outputs_run_ce \
+  ./torchtitan/run_train.sh
+
+CE_MODE=0 STEPS=5 SEQ_LEN=8192 BATCH_SIZE=2 PROFILE=1 PROFILE_FREQ=5 \
+  OUTPUTS_HOST=$PWD/torchtitan/outputs_run_ring \
+  ./torchtitan/run_train.sh
+```
+
+NB: the `run_train.sh` (non-Primus) path does NOT apply the
+SymmMemAllGather patch, so it shows the "FSDP without SDMA dispatch"
+behavior even with `CE_MODE=1` (this is the regression that motivated
+the Primus integration in the first place; see the rocprof "Verified
+via rocprof" subsection above).
 
 ### Path to real SDMA in FSDP: `SymmMemAllGather`
 

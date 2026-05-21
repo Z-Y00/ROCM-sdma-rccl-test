@@ -50,17 +50,29 @@ mkdir -p "${OUTPUTS_HOST}"
 TOKENIZER_HOST_DIR="${SCRIPT_DIR}/.primus_tokenizer_cache/${SCALE}"
 mkdir -p "${TOKENIZER_HOST_DIR}"
 
-case "${SCALE}" in
-    70b)
+# SDMA_MODE=on (default) selects the SDMA-enabled yaml; SDMA_MODE=off
+# selects the CE-baseline yaml that runs through the same Primus stack
+# but with our sdma_symm_mem_collectives patch *disabled*. Useful for
+# perf-A/B comparisons (with profiling on, the chrome traces let us
+# diff the per-AG breakdown).
+SDMA_MODE="${SDMA_MODE:-on}"
+
+case "${SCALE}/${SDMA_MODE}" in
+    70b/on)
         CONFIG="examples/torchtitan/configs/MI300X/llama3.1_70B-BF16-SDMA-pretrain.yaml"
         ASSETS_IN_CTR="/workspace/llama3_70b_assets"
         ;;
-    8b)
+    70b/off)
+        CONFIG="examples/torchtitan/configs/MI300X/llama3.1_70B-BF16-CE-baseline-pretrain.yaml"
+        ASSETS_IN_CTR="/workspace/llama3_70b_assets"
+        ;;
+    8b/on)
         CONFIG="examples/torchtitan/configs/MI300X/llama3.1_8B-BF16-SDMA-pretrain.yaml"
         ASSETS_IN_CTR="/workspace/llama3_8b_assets"
         ;;
     *)
-        echo "Unknown SCALE=${SCALE}; expected 70b or 8b" >&2
+        echo "Unknown SCALE=${SCALE} / SDMA_MODE=${SDMA_MODE}" >&2
+        echo "Valid combos: 70b/on, 70b/off, 8b/on" >&2
         exit 2
         ;;
 esac
@@ -73,6 +85,7 @@ echo "=== Host kernel       : $(uname -r)"
 echo "=== Scale / steps     : ${SCALE} / ${STEPS}"
 echo "=== Config            : ${CONFIG}"
 echo "=== Tokenizer (host)  : ${TOKENIZER_HOST_DIR} (from public mirror ${TOKENIZER_REPO})"
+echo "=== SDMA_MODE         : ${SDMA_MODE}"
 echo "=== Outputs (host)    : ${OUTPUTS_HOST}"
 echo "=== Primus repo (host): ${PRIMUS_DIR}"
 
@@ -208,7 +221,10 @@ RC=$?
 echo ""
 echo "=== Extracting outputs with docker cp ==="
 docker cp "${CNAME}:/workspace/outputs/." "${OUTPUTS_HOST}/" 2>/dev/null || true
+# Primus dumps profile traces under ${dump_folder}/profile_traces/iteration_*;
+# both the trainer dump_folder and Primus workspace dirs are inside the container.
 docker cp "${CNAME}:/workspace/primus/output/." "${OUTPUTS_HOST}/primus_output/" 2>/dev/null || true
+docker cp "${CNAME}:/workspace/primus/outputs/." "${OUTPUTS_HOST}/torchtitan_outputs/" 2>/dev/null || true
 docker rm -f "${CNAME}" >/dev/null 2>&1 || true
 
 if [ ${RC} -ne 0 ]; then
