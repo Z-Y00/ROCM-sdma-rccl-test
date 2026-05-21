@@ -1,0 +1,3 @@
+[submodule "primus"]
+	path = primus
+	url = git@github.com:Z-Y00/Primus.git

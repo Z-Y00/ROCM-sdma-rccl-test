@@ -334,6 +334,35 @@ Three follow-up artifacts contain the raw evidence:
 | `debug/run_sdma_sweep.sh` | sweep harness used to pin the discriminator: `MODE x NCCL_LOCAL_REGISTER` matrix under rocprof, see next subsection |
 | `debug/run_bench_profile.sh` | runs the bench under `torch.profiler` for chrome-trace inspection; the diff to `torchtitan/outputs_ce_localreg0/profile_trace/iteration_5/rank0_trace.json` shows `__amd_rocclr_batchMemOp.kd` only in the bench |
 
+### Productized integration via Primus (this repo's submodule)
+
+The end-to-end Primus integration of the SDMA enabler lives on the
+`feature/sdma-symm-mem-fsdp` branch of [`primus/`](./primus) (a
+submodule of this repo, pointing at <git@github.com:Z-Y00/Primus.git>).
+Two additions there:
+
+| | |
+|---|---|
+| `primus/backends/torchtitan/patches/sdma_symm_mem_collectives.py` | Registers a Primus patch (`torchtitan.fsdp.sdma_symm_mem_collectives`) that runs at trainer `setup` phase. It wraps `torch.distributed.fsdp.fully_shard` so every fully_shard'd module automatically gets `set_custom_all_gather(SymmMemAllGather(group))` and `set_custom_reduce_scatter(SymmMemReduceScatter(group))` attached. Activated via `primus_sdma.enable_symm_mem_collectives: true` in the experiment YAML. Carries `fully_shard.state` across the wrapper (otherwise nested fully_shard calls AttributeError on `fully_shard.state(modules[0])`). Skips multi-param-group modules gracefully. |
+| `examples/torchtitan/configs/MI300X/llama3.1_{8B,70B}-BF16-SDMA-pretrain.yaml` | Experiment YAMLs that flip the patch on, point `model.hf_assets_path` at a runner-provided dir (`PRIMUS_HF_ASSETS_PATH`) for the public `unsloth/Meta-Llama-3.1-70B-Instruct` tokenizer mirror, and drop the `primus_turbo` model converter for a minimal SDMA bring-up. |
+| `torchtitan/run_primus_sdma.sh` (this repo) | Runner that launches the lorrisync image, mounts the Primus submodule, pip-installs the minimal Primus deps, stages the public unsloth tokenizer to a host dir, exports the CE env (`NCCL_CTA_POLICY=2 NCCL_CUMEM_ENABLE=1 NCCL_LOCAL_REGISTER=0 TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK=true LD_PRELOAD=libhip_attr_drain.so NCCL_SOCKET_IFNAME=lo`), and runs `primus-cli direct -- train pretrain --config <8B\|70B>-SDMA-pretrain.yaml`. Knobs: `SCALE=8b\|70b`, `STEPS=N`, `TOKENIZER_REPO=...`. |
+
+Smoke results on 8x MI300X, this build (5-step mock_data smoke):
+
+| scale | step 1 (warmup) | steady state (step 5) | memory |
+|---|---|---|---|
+| Llama-3.1 8B  | tps 120 / mfu 0.4 % | **tps 2960 / mfu 10.99 %** | 27.27 GiB |
+| Llama-3.1 70B | tps 138 / mfu 4.79 % | **tps 595  / mfu 20.55 %** | 164.89 GiB |
+
+(For comparison, the same 70B workload on the *default* `DefaultAllGather`
+path through this repo's `torchtitan/run_train.sh` lands at step 5
+tps 682 / mfu 23.6 %. The SDMA path is slightly slower at this
+small-batch, full-ACK config because comm is already well-hidden by
+recompute, and the SymmMem mempool adds a first-step warmup cost. The
+SDMA path wins on comm-bound workloads where the rocclr SDMA dispatch
+keeps the CUs entirely free; the SDMA-vs-CU choice was independently
+verified via rocprof in the section above.)
+
 ### Path to real SDMA in FSDP: `SymmMemAllGather`
 
 The root question is now: **what makes RCCL choose the SDMA dispatch path
