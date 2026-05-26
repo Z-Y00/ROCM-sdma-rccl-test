@@ -433,7 +433,9 @@ exports the CE env we verified safe on this build (`NCCL_CTA_POLICY=2
 NCCL_CUMEM_ENABLE=1 NCCL_LOCAL_REGISTER=0
 TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK=true
 NCCL_SOCKET_IFNAME=lo LD_PRELOAD=libhip_attr_drain.so
-HSA_SDMA_LINEAR_B2B=0`), and runs `primus-cli direct -- train pretrain
+HSA_SDMA_LINEAR_B2B=0` — forces the SDMA fan-out path; see the
+"Upstream source pin" subsection below for why this is needed on the
+7.14.0-1384 runtime in this container), and runs `primus-cli direct -- train pretrain
 --config <yaml>`. The `SDMA_MODE=on/off` switch selects between the two
 sibling YAMLs in the Primus submodule:
 `examples/torchtitan/configs/MI300X/llama3.1_70B-BF16-{SDMA,CE-baseline}-pretrain.yaml`.
@@ -455,10 +457,10 @@ buffer-provenance modes back-to-back in the same process:
 | `regular_ag` | `torch.empty` (caching allocator)     | `ncclDevKernel_Generic_2`     (CU-driven cuMem peer loads/stores) |
 
 ```bash
-# default: HSA_SDMA_LINEAR_B2B=0 (unblocked), bf16, 209 MiB/rank, 5 warmup + 30 timed
+# default: HSA_SDMA_LINEAR_B2B=0 (force fan-out), bf16, 209 MiB/rank, 5 warmup + 30 timed
 ./debug/run_ag_bw_bench.sh
 
-# Re-run with the throttled HSA default to see the (large) effect of the knob:
+# Re-run forcing the throttled B2B path to see the (large) effect of the knob:
 HSA_SDMA_LINEAR_B2B=1 ./debug/run_ag_bw_bench.sh
 ```
 
@@ -467,18 +469,72 @@ across ranks):
 
 | `HSA_SDMA_LINEAR_B2B` | mode | median ms | algbw | busbw | egress / rank |
 |---|---|---|---|---|---|
-| **1** (HSA default, throttled) | `symm_ag` (SDMA) | 31.71 | 55.3 GB/s | **48.4 GB/s** | 48.4 GB/s |
+| **1** (force B2B) | `symm_ag` (SDMA) | 31.71 | 55.3 GB/s | **48.4 GB/s** | 48.4 GB/s |
 | **1** | `regular_ag` (CU)       | 4.93  | 355.3 GB/s | 310.9 GB/s | 310.9 GB/s |
-| **0** (our default, unblocked) | `symm_ag` (SDMA) | **4.74**  | **370.0 GB/s** | **323.7 GB/s** | 323.7 GB/s |
+| **0** (force fan-out — our default) | `symm_ag` (SDMA) | **4.74**  | **370.0 GB/s** | **323.7 GB/s** | 323.7 GB/s |
 | **0** | `regular_ag` (CU)       | 4.92  | 356.0 GB/s | 311.5 GB/s | 311.5 GB/s |
 
-Two takeaways: (a) the `HSA_SDMA_LINEAR_B2B=1` default is a **6.69×**
-throttle on SDMA AG bandwidth on this build (48 → 324 GB/s busbw on a
-209 MiB AG); `regular_ag` is unaffected (control). (b) With `=0`, SDMA
-is now **~4 % FASTER than the CU-driven path** *and* keeps the CUs
-idle for compute — a strict op-level win at this payload. Both the
-op bench and `torchtitan/run_primus_sdma.sh` default to
-`HSA_SDMA_LINEAR_B2B=0`.
+Two takeaways: (a) the B2B path is a **6.69×** throttle on SDMA AG
+bandwidth on this build (48 → 324 GB/s busbw on a 209 MiB AG);
+`regular_ag` is unaffected (control). (b) With `=0`, SDMA is now
+**~4 % FASTER than the CU-driven path** *and* keeps the CUs idle for
+compute — a strict op-level win at this payload. Both the op bench
+and `torchtitan/run_primus_sdma.sh` default to `HSA_SDMA_LINEAR_B2B=0`.
+
+##### Upstream source pin for `HSA_SDMA_LINEAR_B2B`
+
+The env var is parsed in
+[`projects/rocr-runtime/runtime/hsa-runtime/core/util/flag.h`](https://github.com/ROCm/rocm-systems/blob/develop/projects/rocr-runtime/runtime/hsa-runtime/core/util/flag.h)
+of `ROCm/rocm-systems@develop`:
+
+```cpp
+// HSA_SDMA_LINEAR_B2B: 1=force B2B, 0=force broadcast, unset=auto (size threshold)
+var = os::GetEnvVar("HSA_SDMA_LINEAR_B2B");
+sdma_linear_b2b_ = (var == "0") ? SDMA_DISABLE
+                  : (var == "1") ? SDMA_ENABLE
+                  : SDMA_DEFAULT;
+...
+SDMA_OVERRIDE sdma_linear_b2b_ = SDMA_DEFAULT;          // default (unset)
+```
+
+with `enum SDMA_OVERRIDE { SDMA_DISABLE, SDMA_ENABLE, SDMA_DEFAULT };`.
+**So the literal HSA default is `SDMA_DEFAULT` (unset = auto, not `=1`)**,
+and the path is picked in
+[`projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp`](https://github.com/ROCm/rocm-systems/blob/develop/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_gpu_agent.cpp):
+
+```cpp
+// linearB2BCopy for per-copy sizes in [16KB, 256KB].
+// Above 256KB the fan-out path parallelises across engines.
+constexpr size_t kLinearB2BMinSize = 16 * 1024;
+constexpr size_t kBroadcastMaxSize = 256 * 1024;
+const auto b2b_flag = ...flag().sdma_linear_b2b();
+const bool use_linear_b2b = (b2b_flag == Flag::SDMA_ENABLE) ||
+    (b2b_flag == Flag::SDMA_DEFAULT && op.size >= kLinearB2BMinSize &&
+     op.size <= kBroadcastMaxSize);
+```
+
+Both the env var and the `kBroadcastMaxSize = 256 KB` upper cap were
+added in [commit `a484ae43`](https://github.com/ROCm/rocm-systems/commit/a484ae43c59b53d45d8149b22e7ef98f39820173)
+(2026-05-20, "clr/rocr: Route batch copies through shader blits…"),
+which states the routing intent verbatim:
+
+> sizes < 16 KB use single-engine copy, 16 KB – 256 KB use linearB2B
+> (single submission, no signal overhead), > 256 KB use fan-out
+> (multi-engine parallelism).
+
+So on **upstream `develop`**, the unset/auto default would route our
+~26 MiB per-rank FSDP shards through the fan-out path (i.e. equivalent
+to `=0`) and `HSA_SDMA_LINEAR_B2B=0` would be a no-op.
+
+The ROCm 7.14.0-1384 runtime in our container
+(`lorrisync/therock-main:gfx94X_pytorch2.12_rocm7.14_96bfee1`) was
+built from a snapshot that ships only the **single-dst B2B precursor**
+of that PR — `libhsa-runtime64.so` contains the env-var string and
+`SubmitLinearCopyB2BCommand`, but **lacks** `SubmitLinearCopyMultiB2BCommand`
+and (empirically) lacks the `kBroadcastMaxSize` upper cap for the path
+we hit. As a result, on this build the unset/auto branch routes any
+size ≥ 16 KiB through B2B, which is why the 209 MiB AG above stays on
+the throttled engine until `HSA_SDMA_LINEAR_B2B=0` forces fan-out.
 
 Note that at the Llama-3 70B FSDP smoke (recipe B above), the
 end-to-end TPS is *unchanged* by the B2B knob — both runs show ~732 tps
