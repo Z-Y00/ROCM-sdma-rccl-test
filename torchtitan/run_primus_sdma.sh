@@ -37,6 +37,15 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DEBUG_DIR="${REPO_DIR}/debug"
 PRIMUS_DIR="${REPO_DIR}/primus"
 
+# Auto-init the Primus submodule if the user cloned this repo without
+# --recurse-submodules. Single-command reproduction:
+#   git clone https://github.com/Z-Y00/ROCM-sdma-rccl-test.git && \
+#     cd ROCM-sdma-rccl-test && ./torchtitan/run_primus_sdma.sh
+if [ ! -f "${PRIMUS_DIR}/runner/primus-cli" ]; then
+    echo "=== Primus submodule not initialized; running 'git submodule update --init --recursive primus'"
+    (cd "${REPO_DIR}" && git submodule update --init --recursive primus)
+fi
+
 IMAGE="${ROCM_BUG_TEST_IMAGE:-lorrisync/therock-main:gfx94X_pytorch2.12_rocm7.14_96bfee1}"
 NPROC="${NPROC:-8}"
 SCALE="${SCALE:-70b}"          # 70b or 8b

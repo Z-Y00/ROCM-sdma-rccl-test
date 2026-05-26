@@ -21,6 +21,43 @@ torchtitan/   Llama-3 70B torchtitan training on 8x MI300X
    the LD_PRELOAD interposer and CE-collective env wired in. Script-only
    for now (node busy); see `torchtitan/README.md` for prereqs and knobs.
 
+## Reproduce in two commands
+
+Prereqs: an 8x MI300X node with Docker + `/dev/kfd` + `/dev/dri` and
+internet to pull the public image and the public `unsloth/Meta-Llama-3.1-70B-Instruct`
+tokenizer mirror (no `HF_TOKEN` needed).
+
+```bash
+git clone --recurse-submodules https://github.com/Z-Y00/ROCM-sdma-rccl-test.git
+cd ROCM-sdma-rccl-test && ./torchtitan/run_primus_sdma.sh
+```
+
+That single runner:
+1. Pulls `lorrisync/therock-main:gfx94X_pytorch2.12_rocm7.14_96bfee1`
+   (PyTorch 2.12 + ROCm 7.14).
+2. Builds the `libhip_attr_drain.so` LD_PRELOAD interposer in-container.
+3. Stages the public Llama-3.1 70B tokenizer assets.
+4. Pip-installs Primus' minimal trainer deps.
+5. Runs `primus-cli direct -- train pretrain --config
+   examples/torchtitan/configs/MI300X/llama3.1_70B-BF16-SDMA-pretrain.yaml`
+   with our `sdma_symm_mem_collectives` patch active and
+   `HSA_SDMA_LINEAR_B2B=0` so the SDMA path runs at full xGMI bandwidth.
+
+If you forgot `--recurse-submodules`, the runner auto-initializes the
+Primus submodule on its first invocation.
+
+Common knobs (all optional):
+
+```bash
+SCALE=8b      ./torchtitan/run_primus_sdma.sh   # 8B BF16 smoke (mock data, no HF)
+SDMA_MODE=off ./torchtitan/run_primus_sdma.sh   # 70B BF16 baseline (patch disabled) for A/B
+STEPS=20      ./torchtitan/run_primus_sdma.sh   # longer 70B run
+```
+
+Outputs (Primus + torchtitan logs, chrome trace at iteration 5) land in
+`torchtitan/outputs_primus_sdma_${SCALE}/`. See section (1b) below for
+the rest of the recipes and what to look for in the trace.
+
 ## Test images
 
 The interposer + the bench harness are validated against TheRock PyTorch
