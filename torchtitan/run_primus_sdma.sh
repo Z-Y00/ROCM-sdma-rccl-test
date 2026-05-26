@@ -137,6 +137,12 @@ docker run --name "${CNAME}" \
         echo "############################################################"
         echo "  [2/4] Install Primus deps + init torchtitan submodule"
         echo "############################################################"
+        # The Primus repo is bind-mounted from the host; modern git refuses
+        # to operate on it because the host UID != container root. Whitelist
+        # all bind-mounted paths as safe so submodule init works. Note the
+        # double-quotes -- the outer bash -c block is single-quoted, so a
+        # single-quoted '*' here would lose the quotes and get globbed.
+        git config --global --add safe.directory "*"
         # Primus repo is mounted at /workspace/primus (host -> container).
         cd /workspace/primus
         # Init torchtitan submodule if not present.
