@@ -432,15 +432,61 @@ mounts the Primus submodule, pip-installs the minimal Primus deps,
 exports the CE env we verified safe on this build (`NCCL_CTA_POLICY=2
 NCCL_CUMEM_ENABLE=1 NCCL_LOCAL_REGISTER=0
 TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK=true
-NCCL_SOCKET_IFNAME=lo LD_PRELOAD=libhip_attr_drain.so`), and runs
-`primus-cli direct -- train pretrain --config <yaml>`. The
-`SDMA_MODE=on/off` switch selects between the two sibling YAMLs in the
-Primus submodule:
+NCCL_SOCKET_IFNAME=lo LD_PRELOAD=libhip_attr_drain.so
+HSA_SDMA_LINEAR_B2B=0`), and runs `primus-cli direct -- train pretrain
+--config <yaml>`. The `SDMA_MODE=on/off` switch selects between the two
+sibling YAMLs in the Primus submodule:
 `examples/torchtitan/configs/MI300X/llama3.1_70B-BF16-{SDMA,CE-baseline}-pretrain.yaml`.
 Each pass writes a chrome trace at iteration 5 under
 `outputs_primus_70b_bs2_${tag}/torchtitan_outputs/profile_traces/iteration_5/rank0_trace.json`
 that you can drop into <https://ui.perfetto.dev> to diff the per-AG
 breakdown.
+
+#### B'. Op-level AG bandwidth comparison (~30 s, no training stack)
+
+The standalone bench in `debug/run_ag_bw_bench.sh` benchmarks a single
+`dist.all_gather_into_tensor` at a fixed payload (default = Llama-3 70B
+per-layer AG: 209 MiB / rank input, 1.63 GiB output, bf16), in two
+buffer-provenance modes back-to-back in the same process:
+
+| mode | buffer source | RCCL device kernel |
+|---|---|---|
+| `symm_ag`    | `symm_mem.empty` + rendezvous (cuMem) | `__amd_rocclr_batchMemOp.kd` (SDMA dispatch) |
+| `regular_ag` | `torch.empty` (caching allocator)     | `ncclDevKernel_Generic_2`     (CU-driven cuMem peer loads/stores) |
+
+```bash
+# default: HSA_SDMA_LINEAR_B2B=0 (unblocked), bf16, 209 MiB/rank, 5 warmup + 30 timed
+./debug/run_ag_bw_bench.sh
+
+# Re-run with the throttled HSA default to see the (large) effect of the knob:
+HSA_SDMA_LINEAR_B2B=1 ./debug/run_ag_bw_bench.sh
+```
+
+Result on 8x MI300X, this build (median of 30 timed iters, max-reduced
+across ranks):
+
+| `HSA_SDMA_LINEAR_B2B` | mode | median ms | algbw | busbw | egress / rank |
+|---|---|---|---|---|---|
+| **1** (HSA default, throttled) | `symm_ag` (SDMA) | 31.71 | 55.3 GB/s | **48.4 GB/s** | 48.4 GB/s |
+| **1** | `regular_ag` (CU)       | 4.93  | 355.3 GB/s | 310.9 GB/s | 310.9 GB/s |
+| **0** (our default, unblocked) | `symm_ag` (SDMA) | **4.74**  | **370.0 GB/s** | **323.7 GB/s** | 323.7 GB/s |
+| **0** | `regular_ag` (CU)       | 4.92  | 356.0 GB/s | 311.5 GB/s | 311.5 GB/s |
+
+Two takeaways: (a) the `HSA_SDMA_LINEAR_B2B=1` default is a **6.69×**
+throttle on SDMA AG bandwidth on this build (48 → 324 GB/s busbw on a
+209 MiB AG); `regular_ag` is unaffected (control). (b) With `=0`, SDMA
+is now **~4 % FASTER than the CU-driven path** *and* keeps the CUs
+idle for compute — a strict op-level win at this payload. Both the
+op bench and `torchtitan/run_primus_sdma.sh` default to
+`HSA_SDMA_LINEAR_B2B=0`.
+
+Note that at the Llama-3 70B FSDP smoke (recipe B above), the
+end-to-end TPS is *unchanged* by the B2B knob — both runs show ~732 tps
+/ 27.1 % MFU at step 5 — because that workload has the compute stream
+at 99.7 % busy under full-ACK, so AG events are fully hidden in either
+case. The B2B fix becomes critical only when the comm fraction shows
+up on the critical path (selective/no ACK, smaller models with similar
+global batch, larger world, or MoE configurations).
 
 #### C. Same A/B without Primus (direct torchtitan via the existing runner)
 

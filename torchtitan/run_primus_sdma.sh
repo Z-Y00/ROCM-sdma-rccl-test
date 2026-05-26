@@ -109,6 +109,7 @@ docker run --name "${CNAME}" \
     -e ASSETS_IN_CTR="${ASSETS_IN_CTR}" \
     -e TOKENIZER_REPO="${TOKENIZER_REPO}" \
     -e HF_TOKEN="${HF_TOKEN}" \
+    -e HSA_SDMA_LINEAR_B2B="${HSA_SDMA_LINEAR_B2B:-0}" \
     "${IMAGE}" \
     /bin/bash -c '
         set -e
@@ -183,6 +184,13 @@ EOF
         # hipMemRetainAllocationHandle SIGSEGV on this build.
         export LD_PRELOAD=/tmp/libhip_attr_drain.so
         export HSA_NO_SCRATCH_RECLAIM=1
+        # Critical for SDMA throughput on this build: with the default
+        # (HSA_SDMA_LINEAR_B2B=1) the SDMA dispatch is throttled to
+        # ~48 GB/s busbw on a 209 MiB AG -> 6.4x slower than the
+        # CU-driven path. Setting =0 unlocks the full ~323 GB/s xGMI
+        # ceiling and makes the SDMA path bandwidth-equivalent (and
+        # slightly faster: 4.75 vs 4.93 ms in debug/run_ag_bw_bench.sh).
+        export HSA_SDMA_LINEAR_B2B="${HSA_SDMA_LINEAR_B2B:-0}"
         export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
         export OMP_NUM_THREADS=8
         export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
