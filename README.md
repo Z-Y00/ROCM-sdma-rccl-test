@@ -58,6 +58,29 @@ Outputs (Primus + torchtitan logs, chrome trace at iteration 5) land in
 `torchtitan/outputs_primus_sdma_${SCALE}/`. See section (1b) below for
 the rest of the recipes and what to look for in the trace.
 
+### Alternative image with the full upstream SDMA stack
+
+The default image is the `lorrisync/therock-main` build we used for
+the original bring-up. The newer ROCm-team nightly
+`rocm/pyt-megatron-lm-jax-nightly-private:primus_the_rock_rocm7.14_20260527`
+also works end-to-end and ships the **full post-`a484ae43c`
+(2026-05-20) multi-entry B2B SDMA stack** — both the
+`SDMA multiB2BCopy`/`linearB2BCopy` paths and the 256 KiB upper cap on
+the auto branch. On that image `HSA_SDMA_LINEAR_B2B=0` is a no-op
+because the unset/auto default already routes our ≥256 KiB FSDP shards
+through the fan-out path.
+
+```bash
+ROCM_BUG_TEST_IMAGE=rocm/pyt-megatron-lm-jax-nightly-private:primus_the_rock_rocm7.14_20260527 \
+  SCALE=8b STEPS=5 ./torchtitan/run_primus_sdma.sh
+```
+
+Smoke result (8B BF16 FSDP, 5 steps, 8x MI300X): steady-state
+**5,140 tps / 248 TFLOPS / 19.1 % MFU** (identical to the
+`lorrisync/...` image), profile dumped at step 5, **324 SDMA
+`__amd_rocclr_batchMemOp` dispatches per rank** in the chrome trace
+(vs. 87 CU-kernel control collectives).
+
 ## Test images
 
 The interposer + the bench harness are validated against TheRock PyTorch
