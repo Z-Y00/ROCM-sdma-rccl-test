@@ -27,6 +27,7 @@ Launch: see ./run_bench.sh -- in short:
 """
 from __future__ import annotations
 import argparse
+import os
 
 import torch
 import torch.distributed as dist
@@ -39,6 +40,14 @@ from bench_common import (
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
+    p.add_argument(
+        "--mode", choices=("sdma", "cu"), default="sdma",
+        help="sdma = symmetric-memory buffers -> AG dispatched on the copy "
+             "engine (needs CE env: NCCL_CTA_POLICY=2 ...).  "
+             "cu = regular tensors -> AG runs as an SM/CU-resident RCCL kernel "
+             "(needs default RCCL env). The buffer type is what actually "
+             "decides the dispatch path -- env alone does not.",
+    )
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--timed", type=int, default=20)
     p.add_argument(
@@ -57,6 +66,24 @@ def parse_args() -> argparse.Namespace:
         "--shape", type=str, default="",
         help="Override shape, format 'name:M,N,K' (else sweep llama-70B FFN-up/down)",
     )
+    p.add_argument(
+        "--trace-dir", type=str, default=os.environ.get("BENCH_TRACE_DIR", ""),
+        help="If set, dump a Chrome/Perfetto trace of the overlap region here "
+             "(also settable via BENCH_TRACE_DIR).",
+    )
+    p.add_argument(
+        "--tag", type=str, default=os.environ.get("BENCH_TAG", ""),
+        help="Label baked into trace filenames, e.g. 'sdma' or 'cu' "
+             "(also settable via BENCH_TAG).",
+    )
+    p.add_argument(
+        "--trace-iters", type=int, default=6,
+        help="Number of overlap iterations captured in the profiler trace.",
+    )
+    p.add_argument(
+        "--trace-all-ranks", action="store_true",
+        help="Dump a trace from every rank (default: rank 0 only).",
+    )
     return p.parse_args()
 
 
@@ -67,8 +94,39 @@ def to_torch_dtype(s: str) -> torch.dtype:
 # --------------------------------------------------------------------------
 # One shape: build tensors, run three timings, return a results row.
 # --------------------------------------------------------------------------
+def dump_trace(overlap_iter, shape: Shape, ctx: DistCtx,
+               trace_dir: str, tag: str, trace_iters: int, do_export: bool) -> None:
+    """Capture `trace_iters` overlap iterations with torch.profiler and export a
+    Chrome/Perfetto trace. Comm and compute land on separate CUDA streams, so
+    Perfetto shows the AG and GEMM as parallel lanes -- the SM-contention story.
+
+    NOTE: overlap_iter() contains a collective (all_gather), so EVERY rank must
+    run this loop in lockstep or the collective deadlocks. Only the export to
+    disk is rank-gated (`do_export`)."""
+    from torch.profiler import profile, ProfilerActivity
+
+    device = ctx.device
+    # A couple of un-profiled iters so lazy allocs / autotune don't pollute the trace.
+    for _ in range(3):
+        overlap_iter()
+    torch.cuda.synchronize(device)
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        for _ in range(trace_iters):
+            overlap_iter()
+        torch.cuda.synchronize(device)
+
+    if not do_export:
+        return
+    os.makedirs(trace_dir, exist_ok=True)
+    label = f"_{tag}" if tag else ""
+    out = os.path.join(trace_dir, f"ag_gemm_{shape.name}{label}_rank{ctx.rank}.json")
+    prof.export_chrome_trace(out)
+    print(f"[trace] rank {ctx.rank}: wrote {out}", flush=True)
+
+
 def run_shape(shape: Shape, dtype: torch.dtype, ctx: DistCtx, bench: Bench,
-              gemm_iters: int, comm_iters: int) -> dict:
+              gemm_iters: int, comm_iters: int, args: argparse.Namespace) -> dict:
     device = ctx.device
     W = ctx.world_size
     compute_s, comm_s = make_streams(device)
@@ -85,8 +143,15 @@ def run_shape(shape: Shape, dtype: torch.dtype, ctx: DistCtx, bench: Bench,
         )
     n_in = shape.M * (shape.K // W)
     n_out = shape.M * shape.K
-    x = symm_empty(n_in, dtype, ctx)
-    y = symm_empty(n_out, dtype, ctx)
+    # Buffer type decides the RCCL dispatch path:
+    #   sdma -> symmetric-memory (cuMem-registered) -> copy-engine AG
+    #   cu   -> plain device tensors               -> SM/CU-resident ring AG
+    if args.mode == "sdma":
+        x = symm_empty(n_in, dtype, ctx)
+        y = symm_empty(n_out, dtype, ctx)
+    else:
+        x = torch.empty(n_in, dtype=dtype, device=device)
+        y = torch.empty(n_out, dtype=dtype, device=device)
     x.fill_(float(ctx.rank))  # so we can sanity-check the gather
 
     # Sanity: one AG to fault-in everything before timing.
@@ -128,6 +193,14 @@ def run_shape(shape: Shape, dtype: torch.dtype, ctx: DistCtx, bench: Bench,
     comm_loop_ms = gather_max_ms(bench.run("comm_loop", comm_loop),  ctx)
     over_ms      = gather_max_ms(bench.run("overlap",   overlap_iter), ctx)
 
+    # ---- optional Perfetto/Chrome trace of the overlap region ----------
+    # All ranks run the loop (it contains a collective); only some ranks export.
+    if args.trace_dir:
+        do_export = args.trace_all_ranks or ctx.rank == 0
+        dump_trace(overlap_iter, shape, ctx,
+                   args.trace_dir, args.tag, args.trace_iters, do_export)
+        dist.barrier()
+
     # ---- derived metrics ----------------------------------------------
     flops_per_gemm = 2 * shape.M * shape.N * shape.K
     flops_total    = gemm_iters * flops_per_gemm
@@ -146,6 +219,7 @@ def run_shape(shape: Shape, dtype: torch.dtype, ctx: DistCtx, bench: Bench,
     eff        = max(gemm_loop_ms, comm_loop_ms) / over_ms  # 1.0 = perfect
 
     return {
+        "mode":        args.mode,
         "shape":       shape.name,
         "M,N,K":       f"{shape.M},{shape.N},{shape.K}",
         "G/C":         f"{gemm_iters}/{comm_iters}",
@@ -175,17 +249,17 @@ def main() -> None:
 
     if ctx.rank == 0:
         print(
-            f"\n=== AG + GEMM overlap  (world={ctx.world_size}, dtype={args.dtype}, "
-            f"warmup={args.warmup}, timed={args.timed}, "
+            f"\n=== AG + GEMM overlap  [mode={args.mode}]  (world={ctx.world_size}, "
+            f"dtype={args.dtype}, warmup={args.warmup}, timed={args.timed}, "
             f"gemm_iters={args.gemm_iters}, comm_iters={args.comm_iters}) ===",
             flush=True,
         )
 
-    rows = [run_shape(s, dtype, ctx, bench, args.gemm_iters, args.comm_iters)
+    rows = [run_shape(s, dtype, ctx, bench, args.gemm_iters, args.comm_iters, args)
             for s in shapes]
     print_table(
         rows,
-        headers=("shape", "M,N,K", "G/C",
+        headers=("mode", "shape", "M,N,K", "G/C",
                  "gemm_ms", "TFLOPs", "comm_ms", "ag_GB/s",
                  "overlap_ms", "hidden_ms", "hidden_%", "eff"),
         rank=ctx.rank,
